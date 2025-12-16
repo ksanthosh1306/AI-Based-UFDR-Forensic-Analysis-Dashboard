@@ -1,0 +1,123 @@
+# contacts_dashboard_v2.py
+
+import streamlit as st
+import pandas as pd
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ---------------- CONFIG ----------------
+CONTACTS_FILE = r"C:\Users\SANTHOSH\OneDrive\Desktop\AI_FORENSIC_PROJECT\contacts.csv"
+
+# ---------------- PAGE SETUP ----------------
+st.set_page_config(page_title="UFDR Contacts Dashboard", layout="wide")
+st.markdown(
+    """
+    <style>
+    .main {
+        background-color: #0e1117;
+        color: #ffffff;
+    }
+    .stTextInput > div > div > input {
+        background-color: #262730;
+        color: white;
+        border-radius: 10px;
+    }
+    .block-container {
+        padding-top: 1rem;
+        padding-bottom: 1rem;
+    }
+    .css-1d391kg {
+        background-color: #0e1117;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------- HEADER ----------------
+st.markdown("<h1 style='text-align: center; color: #56c9fc;'>📇 UFDR Contacts Dashboard</h1>", unsafe_allow_html=True)
+st.markdown("<h4 style='text-align: center; color: #9fa6b2;'>Analyze stored contacts, relationships, and location insights</h4>", unsafe_allow_html=True)
+st.markdown("---")
+
+# ---------------- LOAD DATA ----------------
+@st.cache_data
+def load_contacts():
+    if os.path.exists(CONTACTS_FILE):
+        df = pd.read_csv(CONTACTS_FILE)
+        df.columns = df.columns.str.strip()
+        for col in ["name", "phone_number", "relation", "location"]:
+            if col in df.columns:
+                df[col] = df[col].astype(str)
+        return df
+    else:
+        st.error(f"❌ Contacts file not found at: {CONTACTS_FILE}")
+        return pd.DataFrame(columns=["name", "phone_number", "stored_date", "relation", "location"])
+
+contacts_df = load_contacts()
+if contacts_df.empty:
+    st.stop()
+
+# ---------------- CENTER SEARCH SECTION ----------------
+st.markdown("<h3 style='text-align: center; color: #00b4d8;'>🔍 Search Contacts</h3>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; color: #adb5bd;'>Search by name, phone number, relation, or location</p>", unsafe_allow_html=True)
+
+col1, col2, col3 = st.columns([1, 2, 1])
+with col2:
+    search_query = st.text_input("Enter keyword to search", placeholder="e.g. Heisenberg, Albuquerque, Family")
+
+relation_filter = st.multiselect("Filter by Relation", sorted(contacts_df["relation"].unique()), key="rel_filter")
+location_filter = st.multiselect("Filter by Location", sorted(contacts_df["location"].unique()), key="loc_filter")
+
+# ---------------- FILTER DATA ----------------
+filtered_df = contacts_df.copy()
+if search_query:
+    search_query = search_query.lower()
+    filtered_df = filtered_df[
+        filtered_df.apply(lambda r: search_query in str(r.values).lower(), axis=1)
+    ]
+
+if relation_filter:
+    filtered_df = filtered_df[filtered_df["relation"].isin(relation_filter)]
+
+if location_filter:
+    filtered_df = filtered_df[filtered_df["location"].isin(location_filter)]
+
+st.markdown("---")
+st.subheader("📋 Filtered Contact List")
+st.write(f"Found {len(filtered_df)} contacts matching your search.")
+st.dataframe(filtered_df, use_container_width=True)
+
+# ---------------- CREATIVE RELATION GRAPH ----------------
+st.markdown("<h3 style='text-align: center; color: #00b4d8;'>📊 Relation Type Distribution</h3>", unsafe_allow_html=True)
+
+relation_counts = filtered_df["relation"].value_counts().reset_index()
+relation_counts.columns = ["Relation", "Count"]
+
+if relation_counts.empty:
+    st.info("No data to visualize. Try adjusting filters or search keywords.")
+else:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    sns.barplot(
+        data=relation_counts,
+        x="Relation",
+        y="Count",
+        palette="cool",
+        ax=ax
+    )
+    plt.title("Contacts by Relation", fontsize=14, color="#56c9fc")
+    plt.xlabel("Relation Type", fontsize=12, color="white")
+    plt.ylabel("Number of Contacts", fontsize=12, color="white")
+    plt.xticks(rotation=45, color="white")
+    plt.yticks(color="white")
+    plt.grid(axis="y", linestyle="--", alpha=0.3)
+    fig.patch.set_facecolor('#0e1117')
+    ax.set_facecolor('#0e1117')
+    st.pyplot(fig)
+
+# ---------------- FOOTER ----------------
+st.markdown("---")
+st.markdown(
+    "<p style='text-align: center; color: #888;'>© 2025 AI-Forensic UFDR Project | Contacts Dashboard</p>",
+    unsafe_allow_html=True
+)
