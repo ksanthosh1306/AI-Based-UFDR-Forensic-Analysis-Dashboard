@@ -1,0 +1,121 @@
+import os
+import streamlit as st
+import tempfile
+from pathlib import Path
+from transformers import pipeline
+from langdetect import detect, DetectorFactory
+import torch
+import pandas as pd
+
+# ensure deterministic language detection
+DetectorFactory.seed = 0
+
+# ---------------- CONFIG ----------------
+AUDIO_FOLDER = r"C:\Users\SANTHOSH\OneDrive\Desktop\AI_FORENSIC_PROJECT\audio_dataset"
+
+# ---------------- STREAMLIT UI ----------------
+st.set_page_config(page_title="🎧 UFDR Audio Analyzer", layout="wide")
+st.title("🎧 UFDR AI Audio Analysis Dashboard")
+st.caption("Performs speech-to-text transcription, detects language, and analyzes emotional tone of the speaker.")
+
+# ---------------- CACHE MODELS ----------------
+@st.cache_resource(show_spinner=True)
+def load_whisper_model():
+    return pipeline("automatic-speech-recognition", model="openai/whisper-small")
+
+@st.cache_resource(show_spinner=False)
+def load_emotion_model():
+    return pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base", return_all_scores=True)
+
+whisper = load_whisper_model()
+emotion_analyzer = load_emotion_model()
+
+# ---------------- AUDIO PROCESSING ----------------
+@st.cache_data(show_spinner=True)
+def analyze_audio_file(audio_path):
+    """Transcribe, detect language, and analyze emotion."""
+    try:
+        # --- Step 1: Transcribe with Whisper ---
+        result = whisper(audio_path)
+        transcript = result["text"].strip()
+
+        # --- Step 2: Detect Language ---
+        try:
+            language = detect(transcript)
+        except Exception:
+            language = "unknown"
+
+        # --- Step 3: Analyze Emotion ---
+        try:
+            emotion_results = emotion_analyzer(transcript)
+            # Flatten emotion scores
+            scores = {d['label']: d['score'] for d in emotion_results[0]}
+            top_emotion = max(scores, key=scores.get)
+            emotion_score = round(scores[top_emotion], 3)
+        except Exception:
+            top_emotion = "undetected"
+            emotion_score = 0.0
+
+        return {
+            "file": os.path.basename(audio_path),
+            "path": audio_path,
+            "transcript": transcript,
+            "language": language,
+            "emotion": top_emotion.capitalize(),
+            "confidence": emotion_score
+        }
+
+    except Exception as e:
+        return {
+            "file": os.path.basename(audio_path),
+            "path": audio_path,
+            "transcript": f"⚠️ Error processing file: {str(e)}",
+            "language": "unknown",
+            "emotion": "unknown",
+            "confidence": 0.0
+        }
+
+# ---------------- MAIN LOGIC ----------------
+if not os.path.exists(AUDIO_FOLDER):
+    st.error("⚠️ Audio folder not found. Please update the AUDIO_FOLDER path.")
+else:
+    audio_files = [f for f in os.listdir(AUDIO_FOLDER) if f.lower().endswith((".wav", ".mp3", ".m4a", ".ogg"))]
+
+    if not audio_files:
+        st.warning("No audio files found in dataset folder.")
+    else:
+        st.success(f"🎵 Found {len(audio_files)} audio files for analysis.")
+
+        search_query = st.text_input("Search audio by name, transcript, or emotion", key="audio_search")
+
+        results = []
+        with st.spinner("Analyzing audio files (cached)..."):
+            for f in audio_files:
+                path = os.path.join(AUDIO_FOLDER, f)
+                data = analyze_audio_file(path)
+                results.append(data)
+
+        df = pd.DataFrame(results)
+
+        if search_query:
+            q = search_query.lower()
+            df_filtered = df[df.apply(lambda r: q in (r["file"].lower() + " " + r["transcript"].lower() + " " + r["emotion"].lower()), axis=1)]
+        else:
+            df_filtered = df
+
+        for idx, row in df_filtered.iterrows():
+            st.markdown("---")
+            st.markdown(f"#### 🎙️ {row['file']}")
+            st.audio(row["path"])
+
+            st.markdown("### 🗣️ Transcribed Speech")
+            st.text_area("", value=row["transcript"], height=100, label_visibility="collapsed", key=f"trans_{idx}")
+
+            st.markdown("### 🌐 Detected Language")
+            st.info(f"**Language:** {row['language'].upper()}", icon="🗺️")
+
+            st.markdown("### 💬 Detected Emotion / Tone")
+            st.info(f"**Emotion:** {row['emotion']}  \n**Confidence:** {row['confidence']*100:.1f}%", icon="🎭")
+
+        st.markdown("---")
+        st.caption("All audio analyses are cached. Add new files and rerun to reprocess.")
