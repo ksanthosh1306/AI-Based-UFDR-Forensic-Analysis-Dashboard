@@ -1,0 +1,243 @@
+import os
+import time
+import tempfile
+import subprocess
+from pathlib import Path
+from typing import Optional, List
+
+import streamlit as st
+import pandas as pd
+from moviepy.editor import VideoFileClip
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer, util
+import torch
+
+# ---------------- CONFIG ----------------
+VIDEO_FOLDER = r"C:\Users\SANTHOSH\OneDrive\Desktop\AI_FORENSIC_PROJECT\video_dataset"
+MAX_FRAMES = 6
+AUDIO_MIN_SIZE = 1024
+AUDIO_MIN_WORDS = 3
+
+# ---------------- STREAMLIT UI ----------------
+st.set_page_config(page_title="🎥 UFDR AI Video Analyzer", layout="wide")
+st.title("🎥 UFDR AI Video Analyzer")
+st.caption("Accurately extracts speech and visual scene summaries with intelligent caching for fast reloading.")
+
+# ---------------- HELPERS ----------------
+def ffmpeg_available() -> bool:
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except FileNotFoundError:
+        return False
+
+def extract_audio_with_ffmpeg(video_path: str, out_wav: str, sample_rate: int = 16000) -> bool:
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vn", "-ac", "1", "-ar", str(sample_rate),
+        "-f", "wav", str(out_wav)
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except Exception:
+        pass
+    time.sleep(0.3)
+    return Path(out_wav).exists() and Path(out_wav).stat().st_size > AUDIO_MIN_SIZE
+
+def sample_frames(video_path: str, n_frames: int = MAX_FRAMES) -> List[str]:
+    temp_images = []
+    try:
+        clip = VideoFileClip(video_path)
+        duration = clip.duration or 0.0
+        if duration <= 0:
+            clip.close()
+            return []
+        timestamps = [(duration * (i + 1) / (n_frames + 1)) for i in range(n_frames)]
+        for t in timestamps:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                img_path = tmp.name
+            clip.save_frame(img_path, t)
+            temp_images.append(img_path)
+        clip.close()
+    except Exception:
+        temp_images = []
+    return temp_images
+
+def cleanup_files(paths: List[str]):
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+# ---------------- CACHE MODELS ----------------
+@st.cache_resource(show_spinner=True)
+def load_whisper_pipeline():
+    return pipeline("automatic-speech-recognition", model="openai/whisper-small")
+
+@st.cache_resource(show_spinner=False)
+def load_summarizer_pipeline():
+    return pipeline("summarization", model="facebook/bart-large-cnn")
+
+@st.cache_resource(show_spinner=False)
+def load_image_captioner():
+    try:
+        return pipeline("image-to-text", model="Salesforce/blip-image-captioning-base")
+    except Exception:
+        return None
+
+@st.cache_resource(show_spinner=False)
+def load_sentence_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+whisper = load_whisper_pipeline()
+summarizer = load_summarizer_pipeline()
+captioner = load_image_captioner()
+embedder = load_sentence_embedder()
+
+# ---------------- AUDIO EXTRACTION ----------------
+@st.cache_data(show_spinner=True)
+def extract_audio_text_safe(video_path: str) -> Optional[str]:
+    if not ffmpeg_available() or whisper is None:
+        return None
+
+    temp_wav = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            temp_wav = tmp.name
+
+        ok = extract_audio_with_ffmpeg(video_path, temp_wav, sample_rate=16000)
+        if not ok:
+            return None
+
+        result = whisper(temp_wav)
+        txt = (result.get("text") if isinstance(result, dict) else getattr(result, "text", None))
+        if not txt:
+            return None
+        cleaned = str(txt).strip()
+        if len(cleaned.split()) < AUDIO_MIN_WORDS:
+            return None
+        return cleaned
+
+    finally:
+        if temp_wav and os.path.exists(temp_wav):
+            try:
+                os.remove(temp_wav)
+            except PermissionError:
+                pass
+
+# ---------------- VISUAL ANALYSIS ----------------
+@st.cache_data(show_spinner=True)
+def analyze_visual_summary(video_path: str) -> Optional[str]:
+    if captioner is None or embedder is None or summarizer is None:
+        return None
+
+    frame_paths = sample_frames(video_path, n_frames=MAX_FRAMES)
+    if not frame_paths:
+        return None
+
+    captions = []
+    for fp in frame_paths:
+        try:
+            cap_res = captioner(fp)
+            if isinstance(cap_res, list) and len(cap_res) > 0:
+                text = cap_res[0].get("generated_text") or cap_res[0].get("text") or cap_res[0].get("caption") or ""
+            else:
+                text = str(cap_res)
+            text = text.strip()
+            if text:
+                captions.append(text)
+        except Exception:
+            pass
+
+    cleanup_files(frame_paths)
+    if not captions:
+        return None
+
+    try:
+        emb = embedder.encode(captions, convert_to_tensor=True)
+        kept = []
+        used = torch.zeros(len(captions), dtype=torch.bool)
+        for i in range(len(captions)):
+            if used[i]:
+                continue
+            kept.append(captions[i])
+            sims = util.pytorch_cos_sim(emb[i], emb)[0]
+            for j in range(len(captions)):
+                if sims[j] > 0.8:
+                    used[j] = True
+        unique_captions = kept
+    except Exception:
+        unique_captions = list(dict.fromkeys(captions))
+
+    joined = " . ".join(unique_captions)
+    try:
+        sum_res = summarizer(joined, max_length=120, min_length=40, do_sample=True, temperature=0.7)[0]["summary_text"]
+        return sum_res.strip()
+    except Exception:
+        return joined[:600] + "..." if len(joined) > 600 else joined
+
+# ---------------- VIDEO ANALYSIS ----------------
+@st.cache_data(show_spinner=True)
+def analyze_single_video(video_path: str) -> dict:
+    visual_summary = analyze_visual_summary(video_path)
+    audio_text = extract_audio_text_safe(video_path)
+    return {
+        "file": os.path.basename(video_path),
+        "path": video_path,
+        "visual_summary": visual_summary or "No meaningful visual summary generated.",
+        "audio_text": audio_text
+    }
+
+def load_and_analyze_all(videos: list):
+    rows = []
+    for v in videos:
+        path = os.path.join(VIDEO_FOLDER, v)
+        rows.append(analyze_single_video(path))
+    return rows
+
+# ---------------- MAIN DASHBOARD ----------------
+if not os.path.exists(VIDEO_FOLDER):
+    st.error("Video folder not found. Update VIDEO_FOLDER path.")
+else:
+    files = [f for f in os.listdir(VIDEO_FOLDER) if str(f).lower().endswith((".mp4", ".mov", ".mkv", ".avi", ".wav"))]
+    if not files:
+        st.warning("No video files found in dataset folder.")
+    else:
+        search_query = st.text_input("Search videos by name, visual summary, or transcript", key="top_search")
+
+        with st.spinner("Processing videos (cached)..."):
+            video_rows = load_and_analyze_all(files)
+
+        df = pd.DataFrame(video_rows)
+
+        if search_query and search_query.strip():
+            q = search_query.lower()
+            df_filtered = df[df.apply(lambda r: q in (str(r["file"]).lower() + " " +
+                                                      str(r.get("visual_summary","")).lower() + " " +
+                                                      str(r.get("audio_text","") or "").lower()), axis=1)]
+        else:
+            df_filtered = df
+
+        for idx, row in df_filtered.iterrows():
+            st.markdown("---")
+            st.markdown(f"#### 🎬 {row['file']}")
+            try:
+                st.video(row["path"])
+            except Exception:
+                st.warning("Couldn't render this video inline.")
+
+            # Audio first
+            st.markdown("### 🎧 Extracted Audio (Speech-to-Text)")
+            if row.get("audio_text"):
+                st.text_area("", value=row["audio_text"].strip(), height=100, key=f"audio_{idx}", label_visibility="collapsed")
+            else:
+                st.write("_(No meaningful speech detected in this video.)_")
+
+            # Summary next
+            st.markdown("### 🧾 Visual Summary")
+            st.info(row.get("visual_summary", "No meaningful visual summary generated."), icon="🧠")
+
+        st.markdown("---")
+        st.caption("Note: Processing is cached. Add new videos and rerun to analyze them.")
