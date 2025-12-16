@@ -1,0 +1,253 @@
+# call_log_dashboard_v2.py
+import os
+import re
+import streamlit as st
+import pandas as pd
+import networkx as nx
+from pyvis.network import Network
+import streamlit.components.v1 as components
+from transformers import pipeline
+
+# ---------------- CONFIG ----------------
+CALL_LOG_PATH = r"C:\Users\SANTHOSH\OneDrive\Desktop\AI_FORENSIC_PROJECT\call_logs.csv"
+
+# ---------------- SETUP ----------------
+st.set_page_config(page_title="📞 UFDR Call Log Analyzer", layout="wide")
+st.title("📞 AI-based UFDR Call Log Analyzer")
+st.caption("Analyze call logs, visualize caller-receiver connections, and detect key communication patterns.")
+
+# ---------------- LOAD CSV ----------------
+@st.cache_data(show_spinner=True)
+def load_call_data(path):
+    if not os.path.exists(path):
+        st.error("⚠️ Call log file not found. Check your file path.")
+        return pd.DataFrame()
+
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower() for c in df.columns]
+    expected = ["date", "timestamp", "direction", "caller", "receiver", "duration (sec)", "call_type", "location"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = ""
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df["duration (sec)"] = pd.to_numeric(df["duration (sec)"], errors="coerce").fillna(0).astype(int)
+    return df[expected]
+
+calls_df = load_call_data(CALL_LOG_PATH)
+
+# ---------------- NLP MODEL (for summaries) ----------------
+@st.cache_resource(show_spinner=False)
+def load_summarizer():
+    return pipeline("summarization", model="facebook/bart-large-cnn")
+
+summarizer = load_summarizer()
+
+# ---------------- DASHBOARD ----------------
+if calls_df.empty:
+    st.warning("No call data found. Please verify your CSV.")
+else:
+    # ---- OVERVIEW ----
+    st.subheader("📊 Call Summary Overview")
+
+    total_calls = len(calls_df)
+    total_duration = calls_df["duration (sec)"].sum()
+    unique_callers = calls_df["caller"].nunique()
+    unique_receivers = calls_df["receiver"].nunique()
+    avg_duration = round(total_duration / total_calls, 2) if total_calls > 0 else 0
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total Calls", total_calls)
+    c2.metric("Total Duration (sec)", total_duration)
+    c3.metric("Avg Duration (sec)", avg_duration)
+    c4.metric("Unique Callers", unique_callers)
+    c5.metric("Unique Receivers", unique_receivers)
+
+    # ---- SEARCH & FILTER ----
+    st.markdown("### 🔍 Search Calls")
+    query = st.text_input("Search by caller, receiver, location, or keyword", placeholder="e.g. Heisenberg, Warehouse")
+
+    filtered = calls_df
+    if query.strip():
+        q = query.lower()
+        filtered = calls_df[
+            calls_df.apply(
+                lambda row: q in str(row["caller"]).lower()
+                or q in str(row["receiver"]).lower()
+                or q in str(row["location"]).lower()
+                or q in str(row["call_type"]).lower(),
+                axis=1,
+            )
+        ]
+        st.success(f"✅ Found {len(filtered)} matching call records.")
+    else:
+        filtered = calls_df.tail(100)
+        st.info("Showing the latest 100 calls. Use the search box to filter specific data.")
+
+    st.dataframe(filtered, use_container_width=True, height=400)
+
+       # ------------------ 🧠 ENHANCED AI QUERY ENGINE ------------------
+    st.markdown("### 🤖 AI Forensic Query Assistant")
+    ai_query = st.text_input(
+        "Ask your forensic question in plain English",
+        placeholder="e.g. 'How many video calls did Heisenberg and Gus Fring have between Oct 1 and Oct 10?'"
+    )
+
+    if ai_query.strip():
+        from datetime import datetime
+        ai_query_lower = ai_query.lower()
+        response = ""
+        calls_data = calls_df.copy()
+
+        # 🔹 Detect people mentioned
+        names = pd.unique(calls_df[["caller", "receiver"]].values.ravel())
+        mentioned_people = [n for n in names if n and n.lower() in ai_query_lower]
+
+        # 🔹 Detect call type (video, voice, missed)
+        call_types = ["video", "voice", "missed", "incoming", "outgoing"]
+        mentioned_types = [t for t in call_types if t in ai_query_lower]
+
+        # 🔹 Detect date range (supports formats like 05-10-2025 or 5 Oct)
+        date_matches = re.findall(r"(\d{1,2}[-/]\d{1,2}[-/]\d{4})", ai_query)
+        if len(date_matches) >= 2:
+            try:
+                start_date = pd.to_datetime(date_matches[0]).date()
+                end_date = pd.to_datetime(date_matches[1]).date()
+                calls_data = calls_data[
+                    (pd.to_datetime(calls_data["date"]) >= start_date)
+                    & (pd.to_datetime(calls_data["date"]) <= end_date)
+                ]
+            except Exception:
+                pass
+
+        # 🔹 Apply filters based on mentioned names and call types
+        if mentioned_people:
+            calls_data = calls_data[
+                calls_data["caller"].str.lower().isin([p.lower() for p in mentioned_people]) |
+                calls_data["receiver"].str.lower().isin([p.lower() for p in mentioned_people])
+            ]
+
+        if mentioned_types:
+            calls_data = calls_data[
+                calls_data["call_type"].str.lower().str.contains("|".join(mentioned_types))
+            ]
+
+        # 🔹 Generate summary
+        if calls_data.empty:
+            response = "No matching call records found for your query."
+        else:
+            total_calls = len(calls_data)
+            total_duration = int(calls_data["duration (sec)"].sum())
+            top_locations = (
+                calls_data["location"].value_counts().head(2).to_dict()
+                if "location" in calls_data.columns
+                else {}
+            )
+
+            participants = list(set(calls_data["caller"]).union(set(calls_data["receiver"])))
+            participants_text = ", ".join(participants[:5])
+
+            response = f"✅ Found **{total_calls} calls**"
+            if mentioned_types:
+                response += f" of type **{', '.join(mentioned_types)}**"
+            if mentioned_people:
+                response += f" involving **{', '.join(mentioned_people)}**"
+            response += f".\n\n📞 **Total Duration:** {total_duration} seconds.\n👥 **Participants:** {participants_text}."
+
+            if top_locations:
+                locs = ", ".join([f"{loc} ({cnt} calls)" for loc, cnt in top_locations.items()])
+                response += f"\n📍 **Top Locations:** {locs}."
+
+            # Add a smart summary using AI
+            text_snippet = " ".join(
+                calls_data.apply(
+                    lambda r: f"{r['caller']} called {r['receiver']} via {r['call_type']} from {r['location']} lasting {r['duration (sec)']} seconds.",
+                    axis=1,
+                ).tolist()
+            )[:2500]
+
+            try:
+                ai_summary = summarizer(
+                    text_snippet,
+                    max_length=130,
+                    min_length=40,
+                    do_sample=False
+                )[0]["summary_text"]
+                response += f"\n\n🧠 **AI Summary:** {ai_summary}"
+            except Exception:
+                response += "\n\n⚙️ AI summarizer unavailable or text too short."
+
+        st.markdown("#### 🧾 AI Analysis Result")
+        st.info(response)
+
+    # ---- TIMELINE ----
+    st.markdown("### ⏱ Call Volume Timeline")
+    daily_calls = filtered.groupby("date").size().reset_index(name="count")
+    st.line_chart(daily_calls.set_index("date"))
+
+    # ---- TOP CONTACTS ----
+    st.markdown("### 🧍 Top Contacts by Total Duration")
+    top_duration = (
+        filtered.groupby("caller")["duration (sec)"]
+        .sum()
+        .reset_index()
+        .sort_values("duration (sec)", ascending=False)
+    )
+    st.bar_chart(top_duration.set_index("caller").head(10))
+
+    # ---- CONNECTION GRAPH ----
+    st.markdown("### 🕸️ Communication Network Graph")
+    st.caption("Nodes = people, edges = calls. Edge thickness → call frequency. Color → call type.")
+
+    G = nx.DiGraph()
+    for _, row in filtered.iterrows():
+        caller = str(row["caller"])
+        receiver = str(row["receiver"])
+        duration = int(row["duration (sec)"])
+        call_type = str(row["call_type"]).lower()
+
+        color = "#00ccff"
+        if "video" in call_type:
+            color = "#8e44ad"
+        elif "voice" in call_type:
+            color = "#27ae60"
+        elif "missed" in row["direction"].lower():
+            color = "#e74c3c"
+
+        if G.has_edge(caller, receiver):
+            G[caller][receiver]["weight"] += 1
+            G[caller][receiver]["duration"] += duration
+        else:
+            G.add_edge(caller, receiver, weight=1, duration=duration, color=color)
+
+    net = Network(height="800px", width="100%", bgcolor="#0e1117", font_color="white", directed=True)
+    net.barnes_hut(gravity=-30000, central_gravity=0.3, spring_length=250, spring_strength=0.002, damping=0.09)
+
+    for node in G.nodes():
+        total_outgoing = sum(G[node][nbr]["weight"] for nbr in G.successors(node))
+        total_incoming = sum(G[nbr][node]["weight"] for nbr in G.predecessors(node))
+        total_duration = sum(G[node][nbr]["duration"] for nbr in G.successors(node))
+        color = "#00ccff"
+        if "heisenberg" in node.lower():
+            color = "#ff3366"
+        elif "unknown" in node.lower():
+            color = "#ffaa00"
+
+        size = 10 + (total_incoming + total_outgoing)
+        title = f"Outgoing: {total_outgoing}<br>Incoming: {total_incoming}<br>Duration: {total_duration}s"
+        net.add_node(node, label=node, title=title, color=color, size=size)
+
+    for source, target, data in G.edges(data=True):
+        net.add_edge(
+            source,
+            target,
+            value=data["weight"],
+            title=f"Calls: {data['weight']}<br>Duration: {data['duration']} sec",
+            color=data["color"],
+            arrows="to",
+        )
+
+    tmp_path = os.path.join(os.getcwd(), "call_network_graph.html")
+    net.save_graph(tmp_path)
+    with open(tmp_path, "r", encoding="utf-8") as f:
+        components.html(f.read(), height=800, width=1200)
