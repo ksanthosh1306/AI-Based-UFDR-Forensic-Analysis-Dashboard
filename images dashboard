@@ -1,0 +1,127 @@
+import os
+import json
+import streamlit as st
+import pandas as pd
+import torch
+from PIL import Image
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ---------------- CONFIG ----------------
+st.set_page_config(page_title="🧠 UFDR Forensic Image Analyzer", layout="wide", page_icon="🖼")
+
+IMAGE_DIR = r"C:\Users\SANTHOSH\OneDrive\Desktop\AI_FORENSIC_PROJECT\image_dataset\images"
+CAPTION_CACHE = "high_accuracy_image_captions.json"
+MAX_IMAGES = 200
+NUM_THREADS = 4
+
+# ---------------- HEADER ----------------
+st.markdown("<h1 style='text-align:center; color:#00CFFF;'>🧠 UFDR AI-Forensic Image Analyzer</h1>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center; color:gray;'>High-speed, high-accuracy forensic image captioning</p>", unsafe_allow_html=True)
+st.write("---")
+
+# ---------------- LOAD IMAGE FILES ----------------
+@st.cache_data(show_spinner=True)
+def load_images(folder):
+    return [os.path.join(folder, f) for f in os.listdir(folder)
+            if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+
+image_files = load_images(IMAGE_DIR)
+if not image_files:
+    st.error("⚠️ No images found in the dataset folder.")
+    st.stop()
+
+# ---------------- CAPTION CACHE ----------------
+if os.path.exists(CAPTION_CACHE):
+    with open(CAPTION_CACHE, "r", encoding="utf-8") as f:
+        caption_data = json.load(f)
+else:
+    caption_data = {}
+
+# ---------------- FAST + ACCURATE BLIP MODEL ----------------
+@st.cache_resource(show_spinner=True)
+def load_blip_fast():
+    """Load BLIP Base — faster and accurate."""
+    model_name = "Salesforce/blip-image-captioning-base"  # <-- FAST MODEL
+    processor = BlipProcessor.from_pretrained(model_name)
+    model = BlipForConditionalGeneration.from_pretrained(model_name)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+
+    return processor, model, device
+
+processor, model, device = load_blip_fast()
+
+# ---------------- CAPTION FUNCTION (FAST MODE) ----------------
+def generate_caption(img_path):
+    try:
+        image = Image.open(img_path).convert("RGB")
+        inputs = processor(images=image, return_tensors="pt").to(device)
+
+        # FAST & ACCURATE MODE
+        out = model.generate(
+            **inputs,
+            max_length=40,
+            num_beams=3,
+            repetition_penalty=1.1
+        )
+
+        caption = processor.decode(out[0], skip_special_tokens=True)
+        return caption
+
+    except Exception as e:
+        return f"⚠️ Error: {str(e)}"
+
+# ---------------- MULTI-THREAD CAPTIONING ----------------
+def process_uncaptioned_images():
+    uncaptions = [img for img in image_files if img not in caption_data]
+    if not uncaptions:
+        return
+
+    st.info(f"⚡ Generating captions for {len(uncaptions)} images... (Fast BLIP Base Model)")
+    progress = st.progress(0)
+    total = len(uncaptions)
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+        futures = {executor.submit(generate_caption, img): img for img in uncaptions}
+
+        for future in as_completed(futures):
+            img_path = futures[future]
+            caption_data[img_path] = future.result()
+            completed += 1
+            progress.progress(completed / total)
+
+    with open(CAPTION_CACHE, "w", encoding="utf-8") as f:
+        json.dump(caption_data, f, indent=2)
+
+# ---------------- RUN CAPTIONING ----------------
+process_uncaptioned_images()
+
+# ---------------- BUILD DATAFRAME ----------------
+data = [{"file_path": p, "file_name": os.path.basename(p), "caption": caption_data.get(p, "")}
+        for p in image_files]
+images_df = pd.DataFrame(data)
+
+# ---------------- SEARCH ----------------
+st.markdown("<h3 style='text-align:center; color:#00CFFF;'>🔍 Search Forensic Images</h3>", unsafe_allow_html=True)
+query = st.text_input("", placeholder="Search objects or actions (e.g., 'man with gun', 'car accident')", label_visibility="collapsed")
+
+if query:
+    filtered_df = images_df[images_df["caption"].str.lower().str.contains(query.lower())]
+else:
+    filtered_df = images_df
+
+st.markdown(f"<p style='text-align:center; color:gray;'>Showing {len(filtered_df)} images</p>", unsafe_allow_html=True)
+
+# ---------------- DISPLAY IMAGES ----------------
+if filtered_df.empty:
+    st.warning("No matching images found.")
+else:
+    cols = st.columns(5)
+    for i, (_, row) in enumerate(filtered_df.head(MAX_IMAGES).iterrows()):
+        with cols[i % 5]:
+            st.image(row["file_path"], caption=row["caption"], use_container_width=True)
+
+st.markdown("<hr><p style='text-align:center; color:gray;'>UFDR Image Analyzer • Optimized for Speed & Accuracy</p>", unsafe_allow_html=True)
