@@ -1,0 +1,232 @@
+# messages_dashboard_ai_fixed.py
+import os
+import re
+import streamlit as st
+import pandas as pd
+from transformers import pipeline
+
+# ---------------- CONFIG ----------------
+MESSAGE_CSV_PATH = r"C:\Users\SANTHOSH\OneDrive\Desktop\AI_FORENSIC_PROJECT\messages.csv"
+
+# ---------------- SETUP ----------------
+st.set_page_config(page_title="💬 UFDR Message Analyzer", layout="wide")
+st.title("💬 AI-based UFDR Message Analyzer")
+st.caption("Analyze extracted chat logs, search by keywords, and interact with an AI forensic assistant.")
+
+# ---------------- LOAD CSV ----------------
+@st.cache_data(show_spinner=True)
+def load_messages(path):
+    """
+    Load messages CSV while preserving original date/timestamp string formats for display.
+    Also create internal parsed datetime columns for filtering/aggregation.
+    """
+    if not os.path.exists(path):
+        st.error(f"File not found: {path}")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(path, dtype=str)  # read as strings to preserve format
+    except Exception as e:
+        st.error(f"Error loading CSV: {e}")
+        return pd.DataFrame()
+
+    # normalize column names
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    expected = ["date", "timestamp", "direction", "sender", "receiver", "message"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Preserve original strings for display
+    df["date_display"] = df["date"].astype(str).fillna("")
+    df["timestamp_display"] = df["timestamp"].astype(str).fillna("")
+
+    # Parse internally (for filtering/aggregation)
+    df["_ts_parsed"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df["_date_parsed"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+
+    # Retry parsing with dayfirst=True for dd-mm-yyyy
+    mask_ts_na = df["_ts_parsed"].isna() & df["timestamp_display"].str.strip().ne("")
+    if mask_ts_na.any():
+        try:
+            df.loc[mask_ts_na, "_ts_parsed"] = pd.to_datetime(
+                df.loc[mask_ts_na, "timestamp_display"], dayfirst=True, errors="coerce"
+            )
+        except Exception:
+            pass
+
+    mask_date_na = df["_date_parsed"].isna() & df["date_display"].str.strip().ne("")
+    if mask_date_na.any():
+        try:
+            df.loc[mask_date_na, "_date_parsed"] = pd.to_datetime(
+                df.loc[mask_date_na, "date_display"], dayfirst=True, errors="coerce"
+            ).dt.date
+        except Exception:
+            pass
+
+    # Keep original for UI display
+    df["date"] = df["date_display"]
+    df["timestamp"] = df["timestamp_display"]
+
+    # Sort (prefer parsed timestamps if available)
+    if df["_ts_parsed"].notna().any():
+        df = df.sort_values(by="_ts_parsed", ascending=True)
+
+    cols_to_return = expected + ["_date_parsed", "_ts_parsed"]
+    return df[cols_to_return]
+
+
+# ---------------- NLP MODEL (for summaries) ----------------
+@st.cache_resource(show_spinner=False)
+def load_summarizer():
+    return pipeline("summarization", model="facebook/bart-large-cnn")
+
+summarizer = load_summarizer()
+
+# ---------------- DASHBOARD ----------------
+messages_df = load_messages(MESSAGE_CSV_PATH)
+
+if messages_df.empty:
+    st.warning("No message data found. Please verify your CSV file path.")
+else:
+    # ---- OVERVIEW ----
+    st.subheader("📊 Message Summary Overview")
+
+    total_messages = len(messages_df)
+    unique_senders = messages_df["sender"].nunique()
+    unique_receivers = messages_df["receiver"].nunique()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Messages", total_messages)
+    c2.metric("Unique Senders", unique_senders)
+    c3.metric("Unique Receivers", unique_receivers)
+
+    # ---- SEARCH SECTION ----
+    st.markdown("### 🔍 Search Messages")
+    query = st.text_input("Search by keyword, sender, or receiver", placeholder="e.g. Heisenberg, crypto, Gus Fring")
+
+    filtered = messages_df
+    if query.strip():
+        q = query.lower()
+        filtered = messages_df[
+            messages_df.apply(
+                lambda row: q in str(row["message"]).lower()
+                or q in str(row["sender"]).lower()
+                or q in str(row["receiver"]).lower(),
+                axis=1,
+            )
+        ]
+        st.success(f"✅ Found {len(filtered)} matching messages.")
+    else:
+        filtered = messages_df.tail(100)
+        st.info("Showing the latest 100 messages. Use the search box to filter.")
+
+    st.dataframe(filtered, use_container_width=True, height=400)
+
+    # ------------------ 🧠 AI FORENSIC QUERY ASSISTANT ------------------
+    st.markdown("### 🤖 AI Forensic Query Assistant")
+    ai_query = st.text_input(
+        "Ask a question in natural language",
+        placeholder="e.g. 'Summarize all messages from Heisenberg between 5–10 Oct.'"
+    )
+
+    if ai_query:
+        ai_query_lower = ai_query.lower()
+        response = ""
+
+        # Detect names
+        people = pd.unique(messages_df[["sender", "receiver"]].values.ravel())
+        target = next((p for p in people if p and p.lower() in ai_query_lower), None)
+
+        # Detect date range
+        dates = re.findall(r"(\d{1,2}[-/]\d{1,2}[-/]\d{4})", ai_query)
+        date_filtered = messages_df.copy()
+        if len(dates) >= 2:
+            try:
+                start_date = pd.to_datetime(dates[0], errors="coerce")
+                end_date = pd.to_datetime(dates[1], errors="coerce")
+                date_filtered = messages_df[
+                    (pd.to_datetime(messages_df["_date_parsed"]) >= start_date.date())
+                    & (pd.to_datetime(messages_df["_date_parsed"]) <= end_date.date())
+                ]
+            except Exception:
+                pass
+
+        # AI Logic
+        if "summarize" in ai_query_lower or "summary" in ai_query_lower:
+            subset = date_filtered
+            if target:
+                subset = subset[
+                    (subset["sender"].str.lower() == target.lower())
+                    | (subset["receiver"].str.lower() == target.lower())
+                ]
+            text = " ".join(subset["message"].astype(str).values)
+            if not text.strip():
+                response = "No matching messages found to summarize."
+            else:
+                summary = summarizer(text[:3000], max_length=120, min_length=30, do_sample=False)[0]["summary_text"]
+                response = f"🧾 **Summary of Messages**:\n{summary}"
+
+        elif "who" in ai_query_lower and "most" in ai_query_lower:
+            if target:
+                subset = messages_df[
+                    (messages_df["sender"].str.lower() == target.lower())
+                    | (messages_df["receiver"].str.lower() == target.lower())
+                ]
+                contacts = pd.concat([subset["sender"], subset["receiver"]])
+                counts = contacts.value_counts().drop(target, errors="ignore").head(5)
+                response = f"Top contacts with **{target}**:\n"
+                for name, count in counts.items():
+                    response += f"- {name}: {count} messages\n"
+
+        elif "between" in ai_query_lower and "and" in ai_query_lower:
+            names = [p for p in people if p and p.lower() in ai_query_lower]
+            if len(names) >= 2:
+                a, b = names[:2]
+                subset = messages_df[
+                    ((messages_df["sender"].str.lower() == a.lower()) & (messages_df["receiver"].str.lower() == b.lower()))
+                    | ((messages_df["sender"].str.lower() == b.lower()) & (messages_df["receiver"].str.lower() == a.lower()))
+                ]
+                if subset.empty:
+                    response = f"No messages found between **{a}** and **{b}**."
+                else:
+                    text = " ".join(subset["message"].astype(str).values)
+                    summary = summarizer(text[:3000], max_length=120, min_length=30, do_sample=False)[0]["summary_text"]
+                    response = f"📨 **Messages between {a} and {b}:**\n{summary}"
+
+        elif "find" in ai_query_lower or "show" in ai_query_lower:
+            keyword = ai_query_lower.split("find")[-1].strip() if "find" in ai_query_lower else ai_query_lower.split("show")[-1].strip()
+            subset = messages_df[messages_df["message"].str.lower().str.contains(keyword)]
+            if subset.empty:
+                response = f"No messages found containing keyword **{keyword}**."
+            else:
+                st.dataframe(subset, use_container_width=True, height=300)
+                text = " ".join(subset["message"].astype(str).values)
+                summary = summarizer(text[:3000], max_length=120, min_length=30, do_sample=False)[0]["summary_text"]
+                response = f"🧠 Found {len(subset)} messages containing **'{keyword}'**.\n**Summary:** {summary}"
+
+        else:
+            response = "I couldn’t interpret that query clearly. Try specifying a name, date range, or keyword."
+
+        st.markdown("#### 🧾 AI Analysis Result")
+        st.info(response)
+
+    # ---- TIMELINE ----
+    st.markdown("### 🕒 Message Timeline")
+    daily_msgs = filtered.copy()
+    # use parsed date for grouping if valid, else fallback to string
+    if "_date_parsed" in daily_msgs.columns and daily_msgs["_date_parsed"].notna().any():
+        grouped = daily_msgs.groupby("_date_parsed").size().reset_index(name="count")
+        grouped = grouped.rename(columns={"_date_parsed": "date"})
+    else:
+        grouped = daily_msgs.groupby("date").size().reset_index(name="count")
+
+    st.line_chart(grouped.set_index("date"))
+
+    # ---- TOP SENDERS ----
+    st.markdown("### 🧍 Top Senders by Message Count")
+    top_senders = (
+        filtered.groupby("sender").size().reset_index(name="count").sort_values("count", ascending=False)
+    )
+    st.bar_chart(top_senders.set_index("sender").head(10))
